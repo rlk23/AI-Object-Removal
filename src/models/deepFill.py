@@ -5,16 +5,20 @@ import torch.nn.functional as F
 from torch.nn.utils.parametrizations import spectral_norm
 
 
-def _init_conv_layer(conv, activation, mode="fan_out"):
+#code from https://github.com/nipponjo/deepfillv2-pytorch/blob/master/model/networks.py
+#with slight modifications
+
+# ----------------------------------------------------------------------------
+
+def _init_conv_layer(conv, activation, mode='fan_out'):
     if isinstance(activation, nn.LeakyReLU):
-        torch.nn.init.kaiming_uniform_(conv.weight, 
+        torch.nn.init.kaiming_uniform_(conv.weight,
                                        a=activation.negative_slope,
-                                       nonlinearity="leaky_relu",
+                                       nonlinearity='leaky_relu',
                                        mode=mode)
-        
-    elif isinstance(activation,(nn.ReLU, nn.ELU)):
-        torch.nn.init.kaiming_unifrom_(conv.weight, 
-                                       nonlinearity="relu",
+    elif isinstance(activation, (nn.ReLU, nn.ELU)):
+        torch.nn.init.kaiming_uniform_(conv.weight,
+                                       nonlinearity='relu',
                                        mode=mode)
     else:
         pass
@@ -22,15 +26,21 @@ def _init_conv_layer(conv, activation, mode="fan_out"):
         torch.nn.init.zeros_(conv.bias)
 
 
-
 def output_to_image(out):
-    out = (out[0].cpu().permute(1,2,0) + 1.) * 127.5
+    out = (out[0].cpu().permute(1, 2, 0) + 1.) * 127.5
     out = out.to(torch.uint8).numpy()
     return out
 
+# ----------------------------------------------------------------------------
+
+#################################
+########### GENERATOR ###########
+#################################
 
 class GConv(nn.Module):
-
+    """Implements the gated 2D convolution introduced in 
+       `Free-Form Image Inpainting with Gated Convolution`(Yu et al., 2019)
+    """
 
     def __init__(self, cnum_in,
                  cnum_out,
@@ -41,11 +51,12 @@ class GConv(nn.Module):
                  activation=nn.ELU(),
                  bias=True
                  ):
+
         super().__init__()
 
-        padding = rate*(ksize-1) // 2 if padding  == "auto" else padding
+        padding = rate*(ksize-1)//2 if padding == 'auto' else padding
         self.activation = activation
-        self.cnumout = cnum_out
+        self.cnum_out = cnum_out
         num_conv_out = cnum_out if self.cnum_out == 3 or self.activation is None else 2*cnum_out
         self.conv = nn.Conv2d(cnum_in,
                               num_conv_out,
@@ -71,64 +82,72 @@ class GConv(nn.Module):
         y = torch.sigmoid(y)
         x = x * y
         return x
-    
 
-
+# ----------------------------------------------------------------------------
 
 class GDeConv(nn.Module):
+    """Upsampling followed by convolution"""
 
     def __init__(self, cnum_in,
                  cnum_out,
                  padding=1):
-        
         super().__init__()
-        self.conv = GConv(cnum_in, cnum_out,3,1,padding=padding)
+        self.conv = GConv(cnum_in, cnum_out, 3, 1,
+                          padding=padding)
 
     def forward(self, x):
-        x = F.interpolate(x, scale_factor=2, mode="nearest",recompute_scale_factor=False)
+        x = F.interpolate(x, scale_factor=2, mode='nearest',
+                          recompute_scale_factor=False)
         x = self.conv(x)
         return x
-    
+
+# ----------------------------------------------------------------------------
+
 class GDownsamplingBlock(nn.Module):
-    def __init__(self,cnum_in,
+    def __init__(self, cnum_in,
                  cnum_out,
-                 cnum_hidden=None):
+                 cnum_hidden=None
+                 ):
         super().__init__()
         cnum_hidden = cnum_out if cnum_hidden == None else cnum_hidden
-        self.conv1_downsample = GConv(cnum_hidden, cnum_hidden ,3,2)
+        self.conv1_downsample = GConv(cnum_in, cnum_hidden, 3, 2)
         self.conv2 = GConv(cnum_hidden, cnum_out, 3, 1)
-
 
     def forward(self, x):
         x = self.conv1_downsample(x)
         x = self.conv2(x)
         return x
-    
-class GUpsamplingBlock(nn.Module):
-    def __init__(self,cnum_in,
-                 cnum_out,
-                 cnum_hidden=None):
-        super().__init__()
-        cnum_hidden = cnum_out if cnum_hidden == None else cnum_hidden 
-        self.conv1_upsample = GDeConv(cnum_in, cnum_hidden)
-        self.conv2 = GConv(cnum_hidden,cnum_out, 3,1)
 
-    def forward(self,x):
+# ----------------------------------------------------------------------------
+
+class GUpsamplingBlock(nn.Module):
+    def __init__(self, cnum_in,
+                 cnum_out,
+                 cnum_hidden=None
+                 ):
+        super().__init__()
+        cnum_hidden = cnum_out if cnum_hidden == None else cnum_hidden
+        self.conv1_upsample = GDeConv(cnum_in, cnum_hidden)
+        self.conv2 = GConv(cnum_hidden, cnum_out, 3, 1)
+
+    def forward(self, x):
         x = self.conv1_upsample(x)
         x = self.conv2(x)
         return x
 
+# ----------------------------------------------------------------------------
 
 
 class CoarseGenerator(nn.Module):
     def __init__(self, cnum_in, cnum):
         super().__init__()
-        self.conv1 = GConv(cnum_in, cnum//2, 5,1,padding=2)
-        
+        self.conv1 = GConv(cnum_in, cnum//2, 5, 1, padding=2)
 
-        self.down_block1 = GDownsamplingBlock(cnum//2,cnum)
-        self.down_block2 = GDownsamplingBlock(cnum,2*cnum)
+        # downsampling
+        self.down_block1 = GDownsamplingBlock(cnum//2, cnum)
+        self.down_block2 = GDownsamplingBlock(cnum, 2*cnum)
 
+        # bottleneck
         self.conv_bn1 = GConv(2*cnum, 2*cnum, 3, 1)
         self.conv_bn2 = GConv(2*cnum, 2*cnum, 3, rate=2, padding=2)
         self.conv_bn3 = GConv(2*cnum, 2*cnum, 3, rate=4, padding=4)
@@ -145,15 +164,32 @@ class CoarseGenerator(nn.Module):
         self.conv_to_rgb = GConv(cnum//4, 3, 3, 1, activation=None)
         self.tanh = nn.Tanh()
 
-
     def forward(self, x):
         x = self.conv1(x)
 
+        # downsampling
         x = self.down_block1(x)
         x = self.down_block2(x)
 
-        
+        # bottleneck
+        x = self.conv_bn1(x)
+        x = self.conv_bn2(x)
+        x = self.conv_bn3(x)
+        x = self.conv_bn4(x)
+        x = self.conv_bn5(x)
+        x = self.conv_bn6(x)
+        x = self.conv_bn7(x)
 
+        # upsampling
+        x = self.up_block1(x)
+        x = self.up_block2(x)
+
+        # to RGB
+        x = self.conv_to_rgb(x)
+        x = self.tanh(x)
+        return x
+
+# ----------------------------------------------------------------------------
 
 class FineGenerator(nn.Module):
     def __init__(self, cnum, return_flow=False):
@@ -255,9 +291,8 @@ class FineGenerator(nn.Module):
         x = self.tanh(x)
 
         return x, offset_flow
-    
-    
 
+# ----------------------------------------------------------------------------
 
 class Generator(nn.Module):
     def __init__(self, cnum_in=5, cnum=48, return_flow=False, checkpoint=None):
